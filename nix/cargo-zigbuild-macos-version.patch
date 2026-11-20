@@ -1,0 +1,17 @@
+--- a/src/zig/wrapper.rs
++++ b/src/zig/wrapper.rs
+@@ -586,7 +586,13 @@
+             // Zig 0.10.0 switched macOS ABI to none
+             // see https://github.com/ziglang/zig/pull/11684
+             if *zig_version > semver::Version::new(0, 9, 1) {
+-                format!("{arch}-macos-none{abi_suffix}")
++                // Keep Zig's deployment target aligned with rustc's.
++                match std::env::var("MACOSX_DEPLOYMENT_TARGET") {
++                    Ok(version) if !version.is_empty() => {
++                        format!("{arch}-macos.{version}-none{abi_suffix}")
++                    }
++                    _ => format!("{arch}-macos-none{abi_suffix}"),
++                }
+             } else {
+                 format!("{arch}-macos-gnu{abi_suffix}")
+             }

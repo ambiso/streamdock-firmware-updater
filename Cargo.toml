@@ -1,0 +1,15 @@
+[package]
+name = "akp05-updater"
+version = "0.1.0"
+edition = "2024"
+license = "EUPL-1.2"
+publish = false
+
+[dependencies]
+async-hid = { version = "=0.5.3", default-features = false }
+mirajazz = "=0.16.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+tempfile = "3.27"
+tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
