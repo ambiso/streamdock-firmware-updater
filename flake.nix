@@ -1,5 +1,5 @@
 {
-  description = "Linux firmware updater for the MiraBox N4E";
+  description = "Firmware updater for compatible MiraBox Stream Dock devices";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs";
 
@@ -17,6 +17,13 @@
       cargoZigbuild = pkgs.cargo-zigbuild.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [ ./nix/cargo-zigbuild-macos-version.patch ];
       });
+      windowsArmSynchronization = pkgs.runCommand "windows-arm-synchronization" { } ''
+        mkdir -p "$out/lib"
+        # Rust links synchronization.lib for WaitOnAddress. Use Zig's Windows API set.
+        ${pkgs.zig}/bin/zig dlltool -m arm64 \
+          -d ${pkgs.zig}/lib/zig/libc/mingw/lib-common/api-ms-win-core-synch-l1-2-0.def \
+          -l "$out/lib/libsynchronization.a"
+      '';
     in
     {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
@@ -39,16 +46,8 @@
           pkgs.udev
           pkgs.stdenv.cc.cc.libgcc
         ];
-        nativeBuildInputs = [ pkgs.makeWrapper ];
         postInstall = ''
           install -Dm644 LICENSE "$out/share/licenses/akp05-updater/LICENSE"
-          wrapProgram "$out/bin/akp05-updater" --prefix PATH : ${
-            lib.makeBinPath [
-              pkgs.curl
-              pkgs.gnutar
-              pkgs.gzip
-            ]
-          }
         '';
         meta.license = lib.licenses.eupl12;
       };
@@ -56,6 +55,9 @@
       devShells.${system}.release = pkgs.mkShellNoCC {
         packages = [
           cargoZigbuild
+          pkgs.binutils
+          pkgs.gnutar
+          pkgs.gzip
           pkgs.zig
           pkgs.zip
           mingw.stdenv.cc
@@ -64,6 +66,7 @@
         MACOSX_DEPLOYMENT_TARGET = "11.3";
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc.targetPrefix}gcc";
         CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-C target-feature=+crt-static -L native=${mingw.windows.pthreads}/lib";
+        CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=-lunwind -L native=${windowsArmSynchronization}/lib";
       };
 
       formatter.${system} = pkgs.nixfmt;
