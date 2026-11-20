@@ -19,7 +19,13 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: releases
-          path: dist/*
+          path: |
+            dist/streamdock-fw-linux-x86_64
+            dist/streamdock-fw-linux-arm64
+            dist/streamdock-fw-windows-x86_64.exe
+            dist/streamdock-fw-windows-arm64.exe
+            dist/streamdock-fw-macos-arm64
+            dist/SHA256SUMS
           if-no-files-found: error
 
   publish:

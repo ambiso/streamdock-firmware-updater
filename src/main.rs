@@ -1,26 +1,127 @@
+#![cfg_attr(windows, windows_subsystem = "console")]
+
 use std::{
     env,
     error::Error,
     fs::{self, File},
-    io,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
     time::{Duration, Instant},
 };
 
-use async_hid::{AsyncHidWrite, Device as HidDevice, HidBackend};
-use futures_lite::StreamExt;
+use async_hid::{AsyncHidWrite, Device as HidDevice};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 mod catalog;
+mod docks;
+#[cfg(target_os = "linux")]
+mod hid_updater;
+#[cfg(target_os = "linux")]
+mod n4e_image;
+mod tui;
 
 const UPDATER: &str = "33c3:6677";
+const HID_UPDATER: &str = "33c3:8899";
 const CHECK_VERSION: &str = "V3.293N4E.01.007";
 const FLASHER_RELEASE: &str = "https://github.com/boa-z/artinchip-flash/releases/download/v0.2.0";
+const LICENSE: &str = concat!(
+    "Stream Dock Firmware Updater · EUPL-1.2\n",
+    "Source code ",
+    env!("CARGO_PKG_REPOSITORY"),
+    "\n\n",
+    include_str!("../LICENSE"),
+);
+
+/// Firmware updater for compatible MiraBox Stream Dock devices.
+#[derive(Parser)]
+#[command(
+    name = "streamdock-fw",
+    version,
+    after_help = "Run without arguments in a terminal to open the interactive interface."
+)]
+struct Cli {
+    #[command(subcommand)]
+    action: Option<Action>,
+}
+
+#[derive(Subcommand)]
+enum Action {
+    /// List connected Stream Docks.
+    Devices,
+    /// Read firmware from the connected dock.
+    Version(DockArgs),
+    /// Find the latest compatible catalog update without accessing USB.
+    Latest(CatalogArgs),
+    /// Verify the downloads and the burn plan without accessing USB.
+    Check {
+        #[command(flatten)]
+        catalog: CatalogArgs,
+        /// Path to an installed artinchip-flash executable.
+        #[arg(long, value_name = "PATH")]
+        flasher: Option<PathBuf>,
+    },
+    /// Install compatible firmware from the catalog or a local N4E image.
+    #[command(after_help = "On Windows, flash requires --from.")]
+    Flash(FlashArgs),
+    /// Enter USB updater mode without writing firmware.
+    EnterUpdater(DockArgs),
+    /// Open the interactive terminal interface.
+    Tui {
+        /// Path to an installed artinchip-flash executable.
+        #[arg(long, value_name = "PATH")]
+        flasher: Option<PathBuf>,
+    },
+    /// Print the embedded license and source repository.
+    License,
+}
+
+#[derive(Args)]
+struct DockArgs {
+    #[arg(long, hide = true, conflicts_with = "device_key")]
+    usb: Option<String>,
+    #[arg(long, hide = true)]
+    device_key: Option<String>,
+}
+
+#[derive(Args)]
+struct CatalogArgs {
+    /// Installed firmware version to look up in the catalogs.
+    #[arg(long, value_name = "VERSION", default_value = CHECK_VERSION)]
+    from: String,
+    /// Exact catalog model name, required when models share a firmware family.
+    #[arg(long, value_name = "NAME")]
+    model: Option<String>,
+}
+
+#[derive(Args)]
+struct FlashArgs {
+    /// Installed firmware version shown by the dock.
+    #[arg(long, value_name = "VERSION", required = cfg!(windows))]
+    from: Option<String>,
+    /// Exact catalog model name, required when models share a firmware family.
+    #[arg(long, value_name = "NAME")]
+    model: Option<String>,
+    /// Local N4E firmware image to install on Linux, including older releases.
+    #[arg(long, value_name = "IMAGE", conflicts_with = "model")]
+    file: Option<PathBuf>,
+    /// Validate the local file without accessing USB.
+    #[arg(long, requires = "file")]
+    dry_run: bool,
+    /// Confirm installation of the local image for non-interactive use.
+    #[arg(long, requires = "file", conflicts_with = "dry_run")]
+    yes: bool,
+    #[command(flatten)]
+    target: DockArgs,
+    /// Path to an installed artinchip-flash executable.
+    #[arg(long, value_name = "PATH")]
+    flasher: Option<PathBuf>,
+}
 
 fn flasher_asset() -> Result<(&'static str, &'static str, &'static str)> {
     match (env::consts::OS, env::consts::ARCH) {
@@ -45,7 +146,65 @@ fn flasher_asset() -> Result<(&'static str, &'static str, &'static str)> {
     }
 }
 
-fn run(command: &mut Command, action: &str) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallStep {
+    SwitchMode,
+    Flash,
+    Restart,
+    Verify,
+}
+
+enum Progress {
+    Download {
+        name: String,
+        bytes: u64,
+        total: Option<u64>,
+    },
+    Validating,
+    Install(InstallStep),
+}
+
+struct Feedback<'a>(Option<&'a dyn Fn(Progress) -> bool>);
+
+impl Feedback<'_> {
+    fn emit(&self, event: Progress) -> bool {
+        if let Some(emit) = self.0 {
+            return emit(event);
+        }
+        match event {
+            Progress::Download { name, bytes: 0, .. } => println!("Downloading {name}"),
+            Progress::Install(InstallStep::SwitchMode) => {
+                println!("Entering updater mode. Keep the USB cable connected.");
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+fn run(command: &mut Command, action: &str, feedback: &Feedback<'_>) -> Result<()> {
+    if feedback.0.is_some() {
+        let output = command
+            .output()
+            .map_err(|error| format!("{action}: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = stderr
+                .lines()
+                .rev()
+                .chain(stdout.lines().rev())
+                .find(|line| !line.trim().is_empty());
+            let error = format!("{action} failed ({})", output.status);
+            return Err(detail
+                .map_or_else(
+                    || error.clone(),
+                    |detail| format!("{error}\n{}", detail.trim()),
+                )
+                .into());
+        }
+        return Ok(());
+    }
     let status = command
         .status()
         .map_err(|error| format!("{action}: {error}"))?;
@@ -55,8 +214,15 @@ fn run(command: &mut Command, action: &str) -> Result<()> {
     Ok(())
 }
 
-fn download(url: &str, limit: u64, redirects: u32) -> Result<Vec<u8>> {
-    println!("Downloading {url}");
+fn download(url: &str, limit: u64, redirects: u32, feedback: &Feedback<'_>) -> Result<Vec<u8>> {
+    let name = url.to_owned();
+    if !feedback.emit(Progress::Download {
+        name: name.clone(),
+        bytes: 0,
+        total: None,
+    }) {
+        return Err("Download cancelled.".into());
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .https_only(true)
         .max_redirects(redirects)
@@ -71,11 +237,27 @@ fn download(url: &str, limit: u64, redirects: u32) -> Result<Vec<u8>> {
     if !response.status().is_success() {
         return Err(format!("{url}: HTTP {}", response.status()).into());
     }
-    Ok(response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()?)
+    let body = response.body_mut();
+    let total = body.content_length();
+    let mut reader = body.with_config().limit(limit).reader();
+    let mut data = Vec::new();
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let size = reader.read(&mut chunk)?;
+        if size == 0 {
+            return Ok(data);
+        }
+        data.extend_from_slice(&chunk[..size]);
+        if feedback.0.is_some()
+            && !feedback.emit(Progress::Download {
+                name: name.clone(),
+                bytes: data.len() as u64,
+                total,
+            })
+        {
+            return Err("Download cancelled.".into());
+        }
+    }
 }
 
 fn verify_sha256(bytes: &[u8], expected: &str, source: &str) -> Result<()> {
@@ -91,7 +273,11 @@ struct Flasher {
     downloaded: bool,
 }
 
-fn prepare_flasher(dir: &Path, provided: Option<&Path>) -> Result<Flasher> {
+fn prepare_flasher(
+    dir: &Path,
+    provided: Option<&Path>,
+    feedback: &Feedback<'_>,
+) -> Result<Flasher> {
     if let Some(path) = provided {
         return Ok(Flasher {
             path: path.canonicalize()?,
@@ -100,7 +286,7 @@ fn prepare_flasher(dir: &Path, provided: Option<&Path>) -> Result<Flasher> {
     }
     let (archive_name, member, sha256) = flasher_asset()?;
     let url = format!("{FLASHER_RELEASE}/{archive_name}");
-    let bytes = download(&url, 32 * 1024 * 1024, 5)?;
+    let bytes = download(&url, 32 * 1024 * 1024, 5, feedback)?;
     verify_sha256(&bytes, sha256, &url)?;
 
     let flasher = dir.join(format!("artinchip-flash{}", env::consts::EXE_SUFFIX));
@@ -140,13 +326,16 @@ fn prepare_update(
     dir: &Path,
     update: &catalog::Update,
     provided: Option<&Path>,
+    feedback: &Feedback<'_>,
 ) -> Result<(Flasher, PathBuf)> {
     let image = dir.join("firmware.img");
-    fs::write(&image, update.download()?)?;
-    let flasher = prepare_flasher(dir, provided)?;
+    fs::write(&image, update.download(feedback)?)?;
+    let flasher = prepare_flasher(dir, provided, feedback)?;
+    feedback.emit(Progress::Validating);
     run(
         flasher.command().args(["burn", "--plan"]).arg(&image),
         "validate burn plan",
+        feedback,
     )?;
     Ok((flasher, image))
 }
@@ -168,7 +357,7 @@ impl Flasher {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct UsbDevice {
     bus: u8,
     address: u8,
@@ -203,30 +392,26 @@ fn usb_devices(flasher: &Flasher) -> Result<Vec<UsbDevice>> {
     Ok(serde_json::from_slice::<DeviceList>(&output.stdout)?.devices)
 }
 
-fn usb_id(device: &HidDevice) -> String {
-    format!("{:04x}:{:04x}", device.vendor_id, device.product_id)
-}
-
-async fn device(selector: Option<&str>) -> Result<HidDevice> {
-    let backend = HidBackend::default();
-    let mut devices = backend.enumerate().await?.filter(|device| {
-        device.usage_page == 0xffa0
-            && device.usage_id == 1
-            && selector.is_none_or(|selector| usb_id(device).eq_ignore_ascii_case(selector))
+fn usb_port<'a>(
+    devices: &'a [UsbDevice],
+    id: &str,
+    address: Option<(u8, u8)>,
+) -> Option<&'a UsbDevice> {
+    let mut matching = devices.iter().filter(|usb| {
+        usb.matches(id) && address.is_none_or(|address| address == (usb.bus, usb.address))
     });
-    match (devices.next().await, devices.next().await) {
-        (Some(device), None) => Ok(device),
-        _ => Err(
-            "Connect exactly one accessible Stream Dock, or select its USB ID with --usb VID:PID."
-                .into(),
-        ),
+    match (matching.next(), matching.next()) {
+        (Some(port), None) => Some(port),
+        _ => None,
     }
 }
 
 async fn version(device: &HidDevice) -> Result<String> {
+    // Windows reports a zero feature-report buffer length for these docks.
+    // See https://github.com/4ndv/mirajazz/issues/10.
     if cfg!(windows) {
         return Err(
-            "Windows HID does not expose the firmware report. Read its version in Stream Dock."
+            "Read the installed firmware version in Stream Dock → Settings → Device on Windows."
                 .into(),
         );
     }
@@ -239,31 +424,62 @@ async fn version(device: &HidDevice) -> Result<String> {
 }
 
 async fn wait_for_usb(flasher: &Flasher, port: &UsbDevice, id: &str) -> Result<UsbDevice> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         let devices = usb_devices(flasher)?;
         if let Some(device) = devices
             .into_iter()
             .find(|d| d.matches(id) && d.same_port(port))
         {
-            if cfg!(target_os = "linux") && id == UPDATER {
-                // The kernel can report the device before udev or Nook grants access.
-                let node = format!("/dev/bus/usb/{:03}/{:03}", device.bus, device.address);
-                if fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(node)
-                    .is_err()
-                {
-                    sleep(Duration::from_millis(300)).await;
-                    continue;
-                }
-            }
             return Ok(device);
         }
         sleep(Duration::from_millis(300)).await;
     }
     Err(format!("USB device {id} did not become accessible on port {}. Check the USB connection and permissions.", port.path).into())
+}
+
+enum Updater {
+    Bulk(UsbDevice),
+    #[cfg(target_os = "linux")]
+    Hid(hid_updater::HidUpdater),
+}
+
+async fn wait_for_updater(flasher: &Flasher, port: &UsbDevice, allow_hid: bool) -> Result<Updater> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut hid_seen = false;
+    while Instant::now() < deadline {
+        if let Some(updater) = usb_devices(flasher)?.into_iter().find(|device| {
+            device.same_port(port) && (device.matches(UPDATER) || device.matches(HID_UPDATER))
+        }) {
+            if updater.matches(UPDATER) {
+                let node = format!("/dev/bus/usb/{:03}/{:03}", updater.bus, updater.address);
+                if !cfg!(target_os = "linux")
+                    || fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(node)
+                        .is_ok()
+                {
+                    return Ok(Updater::Bulk(updater));
+                }
+            } else {
+                hid_seen = true;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(address) = docks::hid_updater_address(port) {
+            hid_seen = true;
+            if allow_hid && let Some(updater) = docks::open_hid_updater(address).await? {
+                return Ok(Updater::Hid(updater));
+            }
+        }
+        if hid_seen && (!allow_hid || !cfg!(target_os = "linux")) {
+            return Err("This dock entered HID updater mode. HID flashing is currently available for MiraBox N4E images on Linux. Reconnect the dock to return to normal mode.".into());
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    let id = if hid_seen { HID_UPDATER } else { UPDATER };
+    Err(format!("USB updater {id} did not become accessible on port {}. Check the USB connection and permissions, then reconnect the dock before retrying.", port.path).into())
 }
 
 async fn enter_updater(device: &HidDevice) -> Result<()> {
@@ -276,7 +492,10 @@ async fn enter_updater(device: &HidDevice) -> Result<()> {
 }
 
 async fn source_version(device: &HidDevice, supplied: Option<&str>) -> Result<String> {
-    match (version(device).await, supplied) {
+    let reported = timeout(Duration::from_secs(5), version(device))
+        .await
+        .unwrap_or_else(|_| Err("Firmware version read timed out.".into()));
+    match (reported, supplied) {
         (Ok(reported), Some(supplied)) if reported != supplied => {
             Err(format!("The device reports {reported}, but --from specified {supplied}.").into())
         }
@@ -286,155 +505,426 @@ async fn source_version(device: &HidDevice, supplied: Option<&str>) -> Result<St
     }
 }
 
-async fn flash(options: &Options<'_>) -> Result<()> {
-    let dock = device(options.usb).await?;
-    let id = usb_id(&dock);
-    if cfg!(windows) && options.usb.is_none() {
-        return Err(format!(
-            "Windows needs --usb {id} and --from VERSION to confirm the connected dock."
-        )
-        .into());
-    }
-    let installed = source_version(&dock, options.from).await?;
-    let Some(update) = catalog::latest(&installed, options.model)? else {
-        println!("No newer compatible ArtInChip firmware listed for {installed}.");
-        return Ok(());
-    };
-    println!(
-        "Updating {} ({id}) from {installed} to {}.",
-        update.model,
-        update.version()
-    );
+struct PreparedUpdate {
+    flash: PreparedFlash,
+    update: catalog::Update,
+}
 
-    let dir = tempfile::tempdir()?;
-    let (flasher, image) = prepare_update(dir.path(), &update, options.flasher)?;
-    let devices = usb_devices(&flasher)?;
-    let mut ports = devices.iter().filter(|usb| usb.matches(&id));
-    let (Some(port), None) = (ports.next(), ports.next()) else {
-        return Err(format!("Connect exactly one USB device with ID {id}.").into());
+struct PreparedFlash {
+    dock: docks::Dock,
+    installed: String,
+    _directory: tempfile::TempDir,
+    flasher: Flasher,
+    image: PathBuf,
+    port: UsbDevice,
+}
+
+enum InstallOutcome {
+    Verified(String),
+    Rebooted,
+}
+
+async fn locate_dock(dock: &docks::Dock, flasher: &Flasher) -> Result<(docks::Dock, UsbDevice)> {
+    let id = dock.usb_id();
+    let mut connected = docks::list().await?;
+    let Some(index) = connected.iter().position(|current| current.key == dock.key) else {
+        return Err("The selected dock changed. Rescan and select it again.".into());
     };
-    if port.path.is_empty() || devices.iter().any(|d| d.matches(UPDATER)) {
+    if dock.usb_address.is_none()
+        && connected
+            .iter()
+            .filter(|current| current.usb_id() == id)
+            .count()
+            > 1
+    {
+        return Err("Disconnect the other dock of the same model and retry so the selected dock’s USB port can be identified.".into());
+    }
+    let devices = usb_devices(flasher)?;
+    let Some(port) = usb_port(&devices, &id, dock.usb_address) else {
+        return Err("Cannot identify the selected dock’s USB port. Connect it directly by USB and disconnect other docks of the same model.".into());
+    };
+    if port.path.is_empty()
+        || devices
+            .iter()
+            .any(|d| d.matches(UPDATER) || d.matches(HID_UPDATER))
+    {
         return Err(
             "Connect the dock directly and disconnect any other ArtInChip updater devices.".into(),
         );
     }
-    if device(options.usb).await?.id != dock.id
-        || source_version(&dock, options.from).await? != installed
+    Ok((connected.swap_remove(index), port.clone()))
+}
+
+async fn prepare_install(
+    dock: docks::Dock,
+    installed: String,
+    update: catalog::Update,
+    provided: Option<&Path>,
+    feedback: &Feedback<'_>,
+) -> Result<PreparedUpdate> {
+    let directory = tempfile::tempdir()?;
+    let (flasher, image) = prepare_update(directory.path(), &update, provided, feedback)?;
+    let (dock, port) = locate_dock(&dock, &flasher).await?;
+    let flash = PreparedFlash {
+        dock,
+        installed,
+        _directory: directory,
+        flasher,
+        image,
+        port,
+    };
+    Ok(PreparedUpdate { flash, update })
+}
+
+async fn install(prepared: &PreparedUpdate, feedback: &Feedback<'_>) -> Result<InstallOutcome> {
+    install_image(
+        &prepared.flash,
+        |reported| prepared.update.matches_version(reported),
+        false,
+        feedback,
+    )
+    .await
+}
+
+async fn install_image(
+    prepared: &PreparedFlash,
+    matches_version: impl Fn(&str) -> bool,
+    local: bool,
+    feedback: &Feedback<'_>,
+) -> Result<InstallOutcome> {
+    let PreparedFlash {
+        dock,
+        installed,
+        flasher,
+        image,
+        port,
+        ..
+    } = prepared;
+    let id = dock.usb_id();
+    #[cfg(not(target_os = "linux"))]
+    let allow_hid = false;
+    #[cfg(target_os = "linux")]
+    let allow_hid = id == n4e_image::USB_ID && n4e_image::is_n4e_version(installed);
+    #[cfg(target_os = "linux")]
+    let _port_lock = allow_hid.then(|| lock_port(port)).transpose()?;
+
+    let (current, current_port) = locate_dock(dock, flasher).await?;
+    if !current_port.same_port(port)
+        || current_port.address != port.address
+        || source_version(&current.hid, Some(installed)).await? != *installed
     {
-        return Err("The connected dock changed during preparation. Run flash again.".into());
+        return Err("The selected dock changed. Rescan and prepare the update again.".into());
     }
 
-    println!("Entering updater mode. Keep the USB cable connected.");
-    enter_updater(&dock).await?;
+    // Check an N4E image before changing USB modes. Catalog upgrades retain
+    // their bulk-flasher fallback if this image is outside the HID scope.
+    #[cfg(target_os = "linux")]
+    let hid_bytes = if allow_hid {
+        Some(n4e_image::read_image(image)?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let hid_image = hid_bytes
+        .as_deref()
+        .map(n4e_image::N4eImage::parse)
+        .transpose();
+    feedback.emit(Progress::Install(InstallStep::SwitchMode));
+    enter_updater(&current.hid).await?;
 
-    let updater = wait_for_usb(&flasher, port, UPDATER).await?;
-    let address = format!("{}:{}", updater.bus, updater.address);
-    run(
-        flasher
-            .command()
-            .args(["burn", "--device", &address])
-            .arg(&image),
-        "flash firmware",
-    )?;
+    match wait_for_updater(flasher, port, allow_hid).await? {
+        Updater::Bulk(_) if local => {
+            return Err("Local N4E images require HID updater mode (33c3:8899). Reconnect the dock to return to normal mode.".into());
+        }
+        Updater::Bulk(updater) => {
+            let address = format!("{}:{}", updater.bus, updater.address);
+            feedback.emit(Progress::Install(InstallStep::Flash));
+            run(
+                flasher
+                    .command()
+                    .args(["burn", "--device", &address])
+                    .arg(image),
+                "flash firmware",
+                feedback,
+            )?;
+            feedback.emit(Progress::Install(InstallStep::Restart));
+        }
+        #[cfg(target_os = "linux")]
+        Updater::Hid(mut updater) => {
+            let hid_image = hid_image?.ok_or("Missing N4E image.")?;
+            if !matches_version(hid_image.version) {
+                return Err(format!(
+                    "HID image version {:?} differs from the expected firmware.",
+                    hid_image.version
+                )
+                .into());
+            }
+            updater.check_layout().await?;
+            feedback.emit(Progress::Install(InstallStep::Flash));
+            updater
+                .burn(&hid_image, |component| {
+                    if feedback.0.is_none() {
+                        println!(
+                            "Writing {} ({} bytes)",
+                            component.name,
+                            component.data.len()
+                        );
+                    }
+                })
+                .await
+                .map_err(|error| format!("HID flash verification failed: {error}"))?;
+            feedback.emit(Progress::Install(InstallStep::Restart));
+            // A successful reset can disconnect before the final reply.
+            if updater.restart().await.is_err() && feedback.0.is_none() {
+                println!("Flash readback passed. Reconnect the dock if it does not restart.");
+            }
+        }
+    }
 
-    wait_for_usb(&flasher, port, &id).await?;
+    let restarted = wait_for_usb(flasher, port, &id).await?;
+    feedback.emit(Progress::Install(InstallStep::Verify));
     if cfg!(windows) {
-        println!(
-            "The dock rebooted. Check its updated firmware version in Stream Dock (catalog version {}).",
-            update.version()
-        );
-        return Ok(());
+        return Ok(InstallOutcome::Rebooted);
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if let Ok(dock) = device(Some(&id)).await
-            && let Ok(reported) = version(&dock).await
-        {
-            if !update.matches_version(&reported) {
-                return Err(
-                    format!("Device rebooted with unexpected firmware {reported:?}.").into(),
-                );
+        if let Ok(connected) = docks::list().await {
+            let mut matching = connected.iter().filter(|current| {
+                current.usb_id() == id
+                    && match current.usb_address {
+                        Some(address) => address == (restarted.bus, restarted.address),
+                        None => dock.usb_address.is_none(),
+                    }
+            });
+            if let (Some(current), None) = (matching.next(), matching.next())
+                && let Ok(Ok(reported)) =
+                    timeout(Duration::from_secs(3), version(&current.hid)).await
+            {
+                if !matches_version(&reported) {
+                    return Err(
+                        format!("Device rebooted with unexpected firmware {reported:?}.").into(),
+                    );
+                }
+                return Ok(InstallOutcome::Verified(reported));
             }
-            println!("Verified firmware {reported} after reboot.");
-            return Ok(());
         }
         sleep(Duration::from_millis(200)).await;
     }
     Err("The dock rebooted, but the firmware version could not be read. Check it in Stream Dock or run version again.".into())
 }
 
-#[derive(Default)]
-struct Options<'a> {
-    from: Option<&'a str>,
-    model: Option<&'a str>,
-    usb: Option<&'a str>,
-    flasher: Option<&'a Path>,
+#[cfg(target_os = "linux")]
+fn lock_port(port: &UsbDevice) -> Result<File> {
+    let runtime = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(env::temp_dir);
+    let key = Sha256::digest(port.path.as_bytes());
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(runtime.join(format!("streamdock-fw-{}-{key:x}.lock", port.bus)))?;
+    file.try_lock()
+        .map_err(|error| format!("Could not lock the selected USB port for flashing: {error}"))?;
+    Ok(file)
 }
 
-impl<'a> Options<'a> {
-    fn parse(args: &'a [String]) -> Result<Self> {
-        let mut options = Self::default();
-        let (pairs, remainder) = args.as_chunks::<2>();
-        for [flag, value] in pairs {
-            let (flag, value) = (flag.as_str(), value.as_str());
-            match flag {
-                "--from" if options.from.is_none() => options.from = Some(value),
-                "--model" if options.model.is_none() => options.model = Some(value),
-                "--usb" if options.usb.is_none() => options.usb = Some(value),
-                "--flasher" if options.flasher.is_none() => {
-                    options.flasher = Some(Path::new(value))
-                }
-                _ => return Err(format!("Unknown or repeated option {flag:?}.").into()),
+async fn flash(options: FlashArgs) -> Result<()> {
+    if let Some(path) = options.file.as_deref() {
+        return flash_file(&options, path).await;
+    }
+    let dock = docks::select(&options.target).await?;
+    let installed = source_version(&dock.hid, options.from.as_deref()).await?;
+    let Some(update) = catalog::latest(&installed, options.model.as_deref())? else {
+        println!("No newer compatible ArtInChip firmware listed for {installed}.");
+        return Ok(());
+    };
+    println!(
+        "Updating {} ({}) from {installed} to {}.",
+        update.model,
+        dock.usb_id(),
+        update.version()
+    );
+    let feedback = Feedback(None);
+    let prepared = prepare_install(
+        dock,
+        installed,
+        update,
+        options.flasher.as_deref(),
+        &feedback,
+    )
+    .await?;
+    match install(&prepared, &feedback).await? {
+        InstallOutcome::Verified(reported) => {
+            println!("Verified firmware {reported} after reboot.")
+        }
+        InstallOutcome::Rebooted => println!(
+            "The dock rebooted. Check its updated firmware version in Stream Dock (catalog version {}).",
+            prepared.update.version()
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn flash_file(_: &FlashArgs, _: &Path) -> Result<()> {
+    Err("Installing a local N4E image is currently supported on Linux.".into())
+}
+
+#[cfg(target_os = "linux")]
+async fn flash_file(options: &FlashArgs, path: &Path) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let bytes = n4e_image::read_image(path)?;
+    let image = n4e_image::N4eImage::parse(&bytes)?;
+    println!(
+        "MiraBox N4E firmware {} ({})",
+        image.version,
+        path.display()
+    );
+    for component in &image.firmware {
+        println!(
+            "  {}: {} bytes, CRC {:08x}",
+            component.partition,
+            component.data.len(),
+            component.checksum
+        );
+    }
+    if options.dry_run {
+        return Ok(());
+    }
+    let dock = docks::select(&options.target).await?;
+    let installed = source_version(&dock.hid, options.from.as_deref()).await?;
+    if dock.usb_id() != n4e_image::USB_ID || !n4e_image::is_n4e_version(&installed) {
+        return Err("The selected dock did not identify itself as a MiraBox N4E.".into());
+    }
+    println!("{}: {installed} → {}", dock.label, image.version);
+    if !options.yes {
+        if !io::stdin().is_terminal() {
+            return Err("Use --yes to confirm a local flash in a non-interactive session.".into());
+        }
+        print!("Flash the local firmware? This operation may brick your device. [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Flash cancelled.");
+            return Ok(());
+        }
+    }
+    let feedback = Feedback(None);
+    let directory = tempfile::tempdir()?;
+    let staged = directory.path().join("firmware.img");
+    fs::write(&staged, &bytes)?;
+    let flasher = prepare_flasher(directory.path(), options.flasher.as_deref(), &feedback)?;
+    let (dock, port) = locate_dock(&dock, &flasher).await?;
+    let prepared = PreparedFlash {
+        dock,
+        installed,
+        _directory: directory,
+        flasher,
+        image: staged,
+        port,
+    };
+    if let InstallOutcome::Verified(reported) = install_image(
+        &prepared,
+        |reported| reported == image.version,
+        true,
+        &feedback,
+    )
+    .await?
+    {
+        println!("Verified firmware {reported} after reboot.");
+    }
+    Ok(())
+}
+
+fn catalog_update(options: CatalogArgs) -> Result<Option<catalog::Update>> {
+    let installed = options.from;
+    let update = catalog::latest(&installed, options.model.as_deref())?;
+    if let Some(update) = &update {
+        println!("{}: {} → {}", update.model, installed, update.version());
+    } else {
+        println!("No newer compatible ArtInChip firmware listed for {installed}.");
+    }
+    Ok(update)
+}
+
+async fn execute(cli: Cli) -> Result<()> {
+    match cli.action {
+        Some(Action::Devices) => {
+            let docks = docks::list().await?;
+            if docks.is_empty() {
+                println!("No accessible Stream Dock found.");
+            }
+            for dock in docks {
+                println!("{}", dock.label);
             }
         }
-        if !remainder.is_empty() {
-            return Err("Each option needs a value.".into());
+        Some(Action::Version(options)) => {
+            println!("{}", version(&docks::select(&options).await?.hid).await?);
         }
-        Ok(options)
-    }
-}
-
-async fn execute() -> Result<()> {
-    let args: Vec<_> = env::args().skip(1).collect();
-    let command = args.first().map_or("--help", String::as_str);
-    let options = Options::parse(args.get(1..).unwrap_or(&[]))?;
-    match command {
-        "check" | "latest" => {
-            let installed = options.from.unwrap_or(CHECK_VERSION);
-            let Some(update) = catalog::latest(installed, options.model)? else {
-                println!("No newer compatible ArtInChip firmware listed for {installed}.");
-                return Ok(());
-            };
-            println!("{}: {} → {}", update.model, installed, update.version());
-            if command == "check" {
+        Some(Action::Latest(options)) => {
+            catalog_update(options)?;
+        }
+        Some(Action::Check { catalog, flasher }) => {
+            if let Some(update) = catalog_update(catalog)? {
                 let dir = tempfile::tempdir()?;
-                prepare_update(dir.path(), &update, options.flasher)?;
+                prepare_update(dir.path(), &update, flasher.as_deref(), &Feedback(None))?;
                 println!("Download verification and the offline burn plan passed.");
             }
         }
-        "version" => {
-            println!("{}", version(&device(options.usb).await?).await?);
+        Some(Action::Flash(options)) => flash(options).await?,
+        Some(Action::EnterUpdater(options)) => {
+            enter_updater(&docks::select(&options).await?.hid).await?;
+            println!("Requested ArtInChip updater mode. No firmware was written.");
         }
-        "flash" => flash(&options).await?,
-        "enter-updater" => {
-            enter_updater(&device(options.usb).await?).await?;
-            println!("Requested ArtInChip USB mode (33c3:6677). No firmware was written.");
-        }
-        "--help" | "-h" => println!(
-            "Usage: akp05-updater COMMAND [--from VERSION] [--model NAME] [--usb VID:PID] [--flasher PATH]\n\n  version        Read firmware from the connected dock\n  latest         Find the latest compatible catalog update without accessing USB\n  check          Verify the downloads and the burn plan without accessing USB\n  flash          Install the latest compatible firmware on the connected dock\n  enter-updater  Enter USB updater mode without writing firmware\n\nOn Windows, flash requires --from and --usb. If a family is shared across models, supply --model."
-        ),
-        _ => return Err("Use akp05-updater --help for usage.".into()),
+        Some(Action::License) => io::stdout().write_all(LICENSE.as_bytes())?,
+        None if !tui::has_terminal() => Cli::command().print_help()?,
+        Some(Action::Tui { flasher }) => tui::run(flasher)?,
+        None => tui::run(None)?,
     }
     Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match execute().await {
+    match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("akp05-updater: {error}");
+            eprintln!("streamdock-fw: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UsbDevice, usb_port};
+
+    #[test]
+    fn duplicate_models_require_the_selected_physical_address() {
+        let first = UsbDevice {
+            bus: 1,
+            address: 4,
+            path: "1-2".into(),
+            vid: "6603".into(),
+            pid: "1007".into(),
+        };
+        let second = UsbDevice {
+            bus: 2,
+            address: 4,
+            path: "2-3".into(),
+            vid: "6603".into(),
+            pid: "1007".into(),
+        };
+        let devices = [first, second];
+        assert!(usb_port(&devices, "6603:1007", None).is_none());
+        assert_eq!(
+            usb_port(&devices, "6603:1007", Some((2, 4))).unwrap().path,
+            "2-3"
+        );
+        assert!(usb_port(&devices[..1], "6603:1007", Some((2, 4))).is_none());
     }
 }

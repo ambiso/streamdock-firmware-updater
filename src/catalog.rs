@@ -5,7 +5,7 @@ use md5::Digest;
 use md5::Md5;
 use serde::Deserialize;
 
-use crate::{Result, download};
+use crate::{Feedback, Result, download};
 
 const CDN: &str = "https://cdn1.key123.vip/";
 const DOWNLOAD_PREFIX: &str = "https://cdn1.key123.vip/StreamDock/firmware/download/";
@@ -130,7 +130,7 @@ impl Update {
                 .any(|version| version == reported)
     }
 
-    pub fn download(&self) -> Result<Vec<u8>> {
+    pub fn download(&self, feedback: &Feedback<'_>) -> Result<Vec<u8>> {
         let url = self
             .entry
             .image_url()
@@ -141,7 +141,7 @@ impl Update {
             return Err("The catalog does not provide a firmware checksum.".into());
         }
 
-        let image = download(&url.replace(' ', "%20"), MAX_IMAGE, 0)?;
+        let image = download(&url.replace(' ', "%20"), MAX_IMAGE, 0, feedback)?;
         if let Some(expected) = md5 {
             let actual = format!("{:x}", Md5::digest(&image));
             if !actual.eq_ignore_ascii_case(expected) {
@@ -163,15 +163,49 @@ impl Update {
     }
 }
 
+pub enum Lookup {
+    Available(Update),
+    Current,
+    NoCompatibleUpdate,
+    ModelRequired(Vec<String>),
+}
+
+impl Lookup {
+    fn into_update(self, installed: &str) -> Result<Option<Update>> {
+        match self {
+            Self::Available(update) => Ok(Some(update)),
+            Self::Current | Self::NoCompatibleUpdate => Ok(None),
+            Self::ModelRequired(models) => Err(format!(
+                "Firmware {installed} matches several models: {}. Use --model with the exact catalog name.",
+                models.join(", ")
+            ).into()),
+        }
+    }
+}
+
 pub fn latest(installed: &str, model: Option<&str>) -> Result<Option<Update>> {
-    let catalogs = MANIFESTS
-        .iter()
-        .map(|path| {
-            let bytes = download(&format!("{CDN}{path}"), MAX_MANIFEST, 0)?;
-            parse_catalog(&bytes).map_err(|error| format!("{path}: {error}").into())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    select_update(&catalogs, installed, model)
+    Catalogs::fetch(&Feedback(None))?
+        .lookup(installed, model)?
+        .into_update(installed)
+}
+
+pub struct Catalogs(Vec<Catalog>);
+
+impl Catalogs {
+    pub fn fetch(feedback: &Feedback<'_>) -> Result<Self> {
+        let catalogs = MANIFESTS
+            .iter()
+            .map(|path| {
+                let bytes = download(&format!("{CDN}{path}"), MAX_MANIFEST, 0, feedback)?;
+                parse_catalog(&bytes).map_err(|error| format!("{path}: {error}").into())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self(catalogs))
+    }
+
+    pub fn lookup(&self, installed: &str, model: Option<&str>) -> Result<Lookup> {
+        select_update(&self.0, installed, model)
+    }
 }
 
 fn parse_catalog(bytes: &[u8]) -> Result<Catalog> {
@@ -189,11 +223,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<Catalog> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
-fn select_update(
-    catalogs: &[Catalog],
-    installed: &str,
-    model: Option<&str>,
-) -> Result<Option<Update>> {
+fn select_update(catalogs: &[Catalog], installed: &str, model: Option<&str>) -> Result<Lookup> {
     let (family, installed_number) = parse_version(installed)
         .ok_or_else(|| format!("Unrecognized installed firmware version {installed:?}."))?;
     let mut matches = BTreeMap::<&str, Vec<&Model>>::new();
@@ -207,8 +237,9 @@ fn select_update(
         }
     }
     if matches.len() > 1 {
-        let models = matches.keys().copied().collect::<Vec<_>>().join(", ");
-        return Err(format!("Firmware family {family} matches several models: {models}. Use --model with the exact catalog name.").into());
+        return Ok(Lookup::ModelRequired(
+            matches.keys().map(|name| (*name).to_owned()).collect(),
+        ));
     }
     let Some((model, models)) = matches.into_iter().next() else {
         return Err(format!(
@@ -217,14 +248,16 @@ fn select_update(
         .into());
     };
     let mut candidates = BTreeMap::<_, Vec<_>>::new();
+    let mut latest_listed = None;
     for (variant, entry) in models.iter().flat_map(|model| model.entries()) {
-        if variant != family || entry.image_url().is_none() {
+        if variant != family {
             continue;
         }
-        if let Some((_, number)) = parse_version(&entry.version)
-            && number > installed_number
-        {
-            candidates.entry(number).or_default().push(entry);
+        if let Some((_, number)) = parse_version(&entry.version) {
+            latest_listed = latest_listed.max(Some(number));
+            if number > installed_number && entry.image_url().is_some() {
+                candidates.entry(number).or_default().push(entry);
+            }
         }
     }
     'versions: for (number, entries) in candidates.into_iter().rev() {
@@ -254,21 +287,34 @@ fn select_update(
             })
             .map(|(_, entry)| entry.version.clone())
             .collect();
-        return Ok(Some(Update {
+        return Ok(Lookup::Available(Update {
             model: model.to_owned(),
             entry: chosen.clone(),
             alternate_versions,
         }));
     }
-    Ok(None)
+    Ok(if latest_listed == Some(installed_number) {
+        Lookup::Current
+    } else {
+        Lookup::NoCompatibleUpdate
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, select_update};
+    use super::{Catalog, Lookup};
+    use crate::Result;
     use serde_json::json;
 
     const URL: &str = "https://cdn1.key123.vip/StreamDock/firmware/download/dock.img";
+
+    fn select_update(
+        catalogs: &[Catalog],
+        installed: &str,
+        model: Option<&str>,
+    ) -> Result<Option<super::Update>> {
+        super::select_update(catalogs, installed, model)?.into_update(installed)
+    }
 
     #[test]
     fn picks_the_latest_allowed_numeric_version() {
@@ -314,6 +360,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(matches!(
+            super::select_update(&catalogs, "V3.Dock.02.010", None).unwrap(),
+            Lookup::Current
+        ));
+        assert!(matches!(
+            super::select_update(&catalogs, "V3.Dock.02.011", None).unwrap(),
+            Lookup::NoCompatibleUpdate
+        ));
     }
 
     #[test]

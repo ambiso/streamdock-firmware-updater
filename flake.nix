@@ -24,10 +24,18 @@
           -d ${pkgs.zig}/lib/zig/libc/mingw/lib-common/api-ms-win-core-synch-l1-2-0.def \
           -l "$out/lib/libsynchronization.a"
       '';
+      flasherEnv = {
+        AKP05_FLASHER_LOADER = pkgs.stdenv.cc.bintools.dynamicLinker;
+        AKP05_FLASHER_LIBRARY_PATH = lib.makeLibraryPath [
+          pkgs.libusb1
+          pkgs.udev
+          pkgs.stdenv.cc.cc.libgcc
+        ];
+      };
     in
     {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "akp05-updater";
+        pname = "streamdock-firmware-updater";
         version = "0.1.0";
         src = lib.fileset.toSource {
           root = ./.;
@@ -40,33 +48,38 @@
         };
         cargoLock.lockFile = ./Cargo.lock;
 
-        env.AKP05_FLASHER_LOADER = pkgs.stdenv.cc.bintools.dynamicLinker;
-        env.AKP05_FLASHER_LIBRARY_PATH = lib.makeLibraryPath [
-          pkgs.libusb1
-          pkgs.udev
-          pkgs.stdenv.cc.cc.libgcc
-        ];
+        env = flasherEnv;
         postInstall = ''
-          install -Dm644 LICENSE "$out/share/licenses/akp05-updater/LICENSE"
+          install -Dm644 LICENSE "$out/share/licenses/streamdock-firmware-updater/LICENSE"
         '';
-        meta.license = lib.licenses.eupl12;
+        meta = {
+          license = lib.licenses.eupl12;
+          mainProgram = "streamdock-fw";
+        };
       };
 
-      devShells.${system}.release = pkgs.mkShellNoCC {
-        packages = [
-          cargoZigbuild
-          pkgs.binutils
-          pkgs.gnutar
-          pkgs.gzip
-          pkgs.zig
-          pkgs.zip
-          mingw.stdenv.cc
-        ];
-        SDKROOT = macSdk;
-        MACOSX_DEPLOYMENT_TARGET = "11.3";
-        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc.targetPrefix}gcc";
-        CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-C target-feature=+crt-static -L native=${mingw.windows.pthreads}/lib";
-        CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=-lunwind -L native=${windowsArmSynchronization}/lib";
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+          ];
+          env = flasherEnv;
+        };
+
+        release = pkgs.mkShellNoCC {
+          packages = [
+            cargoZigbuild
+            pkgs.binutils
+            pkgs.zig
+            mingw.stdenv.cc
+          ];
+          SDKROOT = macSdk;
+          MACOSX_DEPLOYMENT_TARGET = "11.3";
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "${mingw.stdenv.cc.targetPrefix}gcc";
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-C target-feature=+crt-static -L native=${mingw.windows.pthreads}/lib";
+          CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=-lunwind -L native=${windowsArmSynchronization}/lib";
+        };
       };
 
       formatter.${system} = pkgs.nixfmt;

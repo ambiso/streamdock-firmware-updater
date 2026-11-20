@@ -1,19 +1,20 @@
 ![WARN: LLM GENERATED](https://img.shields.io/badge/WARN-LLM%20GENERATED-FF6347)
 
-# MiraBox Stream Dock firmware updater
+# Stream Dock Firmware Updater
 
 > [!WARNING]
 > **USE AT YOUR OWN RISK.** A failed or incompatible firmware update can make
 > the device unusable. Restoring factory firmware has not been tested.
 
-Looks up the latest compatible firmware in MiraBox's public and test
-catalogs. It supports catalog devices with the Stream Dock HID interface
+Firmware updater for compatible MiraBox Stream Dock devices. It looks up
+the latest firmware in MiraBox's public and test catalogs and supports
+catalog devices with the Stream Dock HID interface
 and an ArtInChip USB update image (`AIC.FW`). The N4E (`6603:1007`)
 upgrade from `V3.293N4E.01.007` to `V3.Mbox_N4E_HJDF.02.018` was tested
 on hardware from Linux.
 
-The updater matches the installed firmware family, applies the catalog's
-minimum version and exclusions, and skips downgrades. If several models
+Catalog upgrades match the installed firmware family, apply the catalog's
+minimum version and exclusions, and skip downgrades. If several models
 share the same family, pass the exact catalog name with `--model NAME`.
 An entry needs a matching version and a checksum before it can be flashed.
 
@@ -25,25 +26,49 @@ MiraBox's HTTPS catalog. The tested N4E image and the downloaded
 
 ## Downloads
 
-- [Linux x86-64][linux]
-- [Linux ARM64][linux-arm64] (requires a native flasher)
-- [Windows x86-64][windows]
-- [Windows ARM64][windows-arm64] (Windows 11)
-- [macOS Apple Silicon][macos]
-- [SHA-256 checksums][checksums]
+Download the executable for your platform from [GitHub Releases][releases].
+The release also provides `SHA256SUMS` for verifying the download.
 
-Extract the archive for your platform. The updater downloads and
-extracts the verified flasher without requiring `curl`, `tar` or `gzip`.
-Use `akp05-updater latest --from VERSION` to look up a particular firmware
-family without accessing USB. Use `check` in place of `latest` to verify
-the downloads and the offline burn plan as well.
+| Platform | Executable |
+| --- | --- |
+| Windows x86-64 | `streamdock-fw-windows-x86_64.exe` |
+| Windows ARM64 (Windows 11) | `streamdock-fw-windows-arm64.exe` |
+| Linux x86-64 | `streamdock-fw-linux-x86_64` |
+| Linux ARM64 (requires a native flasher) | `streamdock-fw-linux-arm64` |
+| macOS Apple Silicon | `streamdock-fw-macos-arm64` |
+
+The v0.1.0 release uses the original `akp05-updater` name.
+
+## Terminal interface
+
+On Windows, double-click the downloaded `.exe` to open the interface.
+On Linux and macOS, open a terminal, mark the downloaded file executable
+with `chmod +x`, and run it without arguments. The examples below use
+`streamdock-fw` as the executable name.
+
+The picker shows each dock's installed version and whether an update is
+available. Select a dock with the arrow keys and press Enter to prepare
+its upgrade. Confirm **Update** only when you're ready to leave the dock
+connected through flashing and reboot. Press Esc to return to the picker
+or L from the picker to view the embedded EUPL-1.2 license.
+
+Press R on either screen to refresh the dock list, firmware reads, and
+catalogs. Use Ctrl+R while entering a firmware version.
+
+Use `--help` for command-line options and `streamdock-fw devices` to list
+connected docks. `streamdock-fw latest --from VERSION`
+looks up a firmware family without accessing USB. Use `check` in place of
+`latest` to verify the downloads and the offline burn plan as well. The
+updater downloads and extracts the verified flasher without requiring
+`curl`, `tar` or `gzip`.
 
 ## Flash the device
 
 Quit OpenDeck and Stream Dock before flashing. Connect a single dock
-directly to the host. Keep the cable connected until the command exits.
-The update overwrites the bootloader and firmware. Restoring factory
-firmware has not been tested.
+directly to the host. Keep the cable connected while it is flashing.
+The bulk USB updater overwrites the bootloader and firmware. The N4E HID
+updater writes the firmware and resources, preserving the bootloader,
+settings, and data. Restoring factory firmware has not been tested.
 
 ### Linux
 
@@ -53,20 +78,39 @@ flasher needs glibc 2.39 or newer, libusb 1.0, and libudev
 the flasher can reopen the device after USB re-enumeration.
 
 ```sh
-sudo ./akp05-updater version
-sudo ./akp05-updater flash
+sudo ./streamdock-fw version
+sudo ./streamdock-fw flash
 ```
 
-With udev access to the dock's hidraw interface and the updater
-(`33c3:6677`), run without `sudo`. On NixOS, build with `nix build`
-and use `./result/bin/akp05-updater` to get the flasher's runtime
+With udev access to the dock's hidraw interface and its updater, run
+without `sudo`. The bulk updater uses USB device `33c3:6677`.
+N4E firmware with the HID updater requires hidraw access to `33c3:8899`.
+On NixOS, build with `nix build`
+and use `./result/bin/streamdock-fw` to get the flasher's runtime
 libraries.
+
+To install a local vendor N4E image through the HID updater on Linux,
+including an older release, first validate the file and then run the
+same command without `--dry-run`:
+
+```sh
+streamdock-fw flash --file /path/to/firmware.img --dry-run
+streamdock-fw flash --file /path/to/firmware.img
+```
+
+The command reads the installed version, asks for confirmation, checks
+the dock's live flash layout and verifies both partitions after writing.
+The dry run checks the file without accessing the dock. On Linux, an
+N4E HID downgrade from `02.018` to `02.014` passed partition readback
+and firmware version verification after reboot.
 
 On Linux ARM64, download the [flasher source][flasher-source] and build
 it on ARM64 with `cargo build --release --bin artinchip-flash`. The
 build needs pkg-config and the development packages for libusb and
 libudev. Pass the resulting executable to
-`flash --flasher /path/to/target/release/artinchip-flash`. The upstream
+`tui --flasher /path/to/target/release/artinchip-flash` for the guided
+interface or `flash --flasher /path/to/target/release/artinchip-flash`
+for the CLI. The upstream
 release currently provides a Linux x86-64 binary.
 
 ### Windows
@@ -76,20 +120,18 @@ if the flasher cannot find `VCRUNTIME140.dll`. The ARM64 updater runs
 natively on Windows 11 and uses [emulation][win-arm] for the downloaded
 x64 flasher. Windows on ARM needs an ARM64 WinUSB driver.
 
-If the ArtInChip USB updater lacks a WinUSB driver, run
-`.\akp05-updater.exe enter-updater`, then use [Zadig][zadig] to install
-WinUSB for USB device **`33c3:6677`**. Reconnect the deck to return to
-normal mode before flashing.
+If Windows cannot open the ArtInChip USB updater, use [Zadig][zadig]
+to install WinUSB for USB device **`33c3:6677`** while the dock is in
+updater mode. You can also enter that mode with
+`streamdock-fw enter-updater`. Reconnect the dock and rescan before
+retrying the update.
 
 Read the current version under **Stream Dock → Settings → Device**, then
-quit Stream Dock. Supply the exact firmware version you saw and the
-dock's USB VID:PID. For example, for the tested N4E:
+quit Stream Dock. Select your dock in the updater and enter the exact
+firmware version you saw.
 
-```powershell
-.\akp05-updater.exe flash --from V3.293N4E.01.007 --usb 6603:1007
-```
-
-After the dock restarts, confirm the new firmware in Stream Dock.
+After the dock restarts, enter the version shown in Stream Dock to
+confirm the update.
 
 ### macOS
 
@@ -97,8 +139,8 @@ The upstream flasher requires Apple Silicon and Homebrew libusb
 (`brew install libusb`). Run from Terminal.
 
 ```sh
-./akp05-updater version
-./akp05-updater flash
+./streamdock-fw version
+./streamdock-fw flash
 ```
 
 If macOS cannot read the firmware report, use `flash --from VERSION`
@@ -107,15 +149,15 @@ with the exact version from Stream Dock and verify the new version there.
 ## Build from source
 
 Run `cargo build --release --locked --target-dir target` for a native
-build. To create the release archives from x86-64 Linux with Nix
+build. To create the standalone release binaries from x86-64 Linux with Nix
 and rustup installed, use the same command as GitHub Actions.
 
 ```sh
 nix develop .#release -c bash scripts/release.sh
 ```
 
-CI builds the archives for pushes and pull requests, and publishes the
-download links above when a `v*` tag is pushed.
+CI builds the binaries for pushes and pull requests, and publishes them
+on GitHub Releases when a `v*` tag is pushed.
 On Linux, the macOS build uses a pinned SDK for the IOKit and Foundation
 linker stubs.
 
@@ -129,12 +171,7 @@ security audit. Hardware testing covered the MiraBox N4E on Linux.
 
 [flasher]: https://github.com/boa-z/artinchip-flash/releases/tag/v0.2.0
 [flasher-source]: https://github.com/boa-z/artinchip-flash/archive/refs/tags/v0.2.0.tar.gz
-[linux]: https://github.com/ambiso/akp05-updater/releases/latest/download/akp05-updater-linux-x86_64.tar.gz
-[linux-arm64]: https://github.com/ambiso/akp05-updater/releases/latest/download/akp05-updater-linux-arm64.tar.gz
-[windows]: https://github.com/ambiso/akp05-updater/releases/latest/download/akp05-updater-windows-x86_64.zip
-[windows-arm64]: https://github.com/ambiso/akp05-updater/releases/latest/download/akp05-updater-windows-arm64.zip
-[macos]: https://github.com/ambiso/akp05-updater/releases/latest/download/akp05-updater-macos-arm64.tar.gz
-[checksums]: https://github.com/ambiso/akp05-updater/releases/latest/download/SHA256SUMS
+[releases]: https://github.com/ambiso/streamdock-firmware-updater/releases/latest
 [zadig]: https://zadig.akeo.ie/
 [vcredist]: https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
 [win-arm]: https://learn.microsoft.com/en-us/windows/arm/apps-on-arm-x86-emulation
