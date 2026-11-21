@@ -24,33 +24,29 @@
           -d ${pkgs.zig}/lib/zig/libc/mingw/lib-common/api-ms-win-core-synch-l1-2-0.def \
           -l "$out/lib/libsynchronization.a"
       '';
-      flasherEnv = {
-        AKP05_FLASHER_LOADER = pkgs.stdenv.cc.bintools.dynamicLinker;
-        AKP05_FLASHER_LIBRARY_PATH = lib.makeLibraryPath [
-          pkgs.libusb1
-          pkgs.udev
-          pkgs.stdenv.cc.cc.libgcc
-        ];
-      };
     in
     {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
         pname = "streamdock-firmware-updater";
-        version = "0.1.0";
+        version = "0.2.0";
         src = lib.fileset.toSource {
           root = ./.;
           fileset = lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
             ./LICENSE
+            ./licenses
             ./src
           ];
         };
-        cargoLock.lockFile = ./Cargo.lock;
+        cargoLock = {
+          lockFile = ./Cargo.lock;
+          outputHashes."aic-upg-core-0.2.0" = "sha256-t9KMQVIcvjPr+KpPjD/5r/IQG8iu8OAfyJCSsv4V2u0=";
+        };
 
-        env = flasherEnv;
         postInstall = ''
           install -Dm644 LICENSE "$out/share/licenses/streamdock-firmware-updater/LICENSE"
+          install -Dm644 licenses/artinchip-flash.txt "$out/share/licenses/streamdock-firmware-updater/artinchip-flash.txt"
         '';
         meta = {
           license = lib.licenses.eupl12;
@@ -64,7 +60,6 @@
             pkgs.cargo
             pkgs.rustc
           ];
-          env = flasherEnv;
         };
 
         release = pkgs.mkShellNoCC {

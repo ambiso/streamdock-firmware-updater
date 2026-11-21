@@ -1,6 +1,6 @@
 [package]
 name = "streamdock-firmware-updater"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "EUPL-1.2"
 repository = "https://github.com/ambiso/streamdock-firmware-updater"
@@ -11,22 +11,17 @@ name = "streamdock-fw"
 path = "src/main.rs"
 
 [dependencies]
+artinchip-flash = { git = "https://github.com/boa-z/artinchip-flash.git", rev = "3945a945dbf7711d205e74db58086021f9474141", default-features = false }
 async-hid = { version = "=0.5.3", default-features = false, features = ["tokio", "win32"] }
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 futures-lite = "2"
 md-5 = "0.10"
+nusb = "0.2.9"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
-tempfile = "3.27"
 tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
 tui-input = { version = "0.15", default-features = false, features = ["crossterm"] }
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
-
-[target.'cfg(unix)'.dependencies]
-tar = { version = "0.4", default-features = false }
-
-[target.'cfg(windows)'.dependencies]
-zip = { version = "9", default-features = false, features = ["deflate-flate2"] }

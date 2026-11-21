@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal},
-    path::PathBuf,
     sync::{
         Arc,
         mpsc::{self, Receiver, Sender, TryRecvError},
@@ -222,7 +221,6 @@ struct App {
     verified: BTreeMap<SerialIdentity, String>,
     detail: Option<Detail>,
     worker: Option<Job<WorkerEvent>>,
-    flasher: Option<PathBuf>,
     license: Option<u16>,
 }
 
@@ -376,7 +374,6 @@ impl App {
             return;
         };
         let key = detail.key.clone();
-        let flasher = self.flasher.clone();
         detail.notice = None;
         let catalogs = match &self.catalogs {
             Some(Ok(catalogs)) => Arc::clone(catalogs),
@@ -400,9 +397,7 @@ impl App {
             match catalogs.lookup(&installed, model.as_deref())? {
                 catalog::Lookup::Available(update) => runtime()?.block_on(async {
                     let dock = docks::select_by_key(&key).await?;
-                    let plan =
-                        prepare_install(dock, installed, update, flasher.as_deref(), feedback)
-                            .await?;
+                    let plan = prepare_install(dock, installed, update, feedback).await?;
                     Ok(Outcome::Ready(Box::new(plan)))
                 }),
                 catalog::Lookup::Current => Ok(Outcome::Current),
@@ -867,8 +862,6 @@ fn draw_download(frame: &mut Frame, area: Rect, detail: &Detail) {
         Some(Progress::Download { name, bytes, total }) => {
             let title = if name.contains("firmware-version-check") {
                 "Checking for updates"
-            } else if name.contains("artinchip-flash") {
-                "Downloading flasher"
             } else {
                 "Downloading firmware"
             };
@@ -992,16 +985,13 @@ pub fn has_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-pub fn run(flasher: Option<PathBuf>) -> io::Result<()> {
+pub fn run() -> io::Result<()> {
     if !has_terminal() {
         return Err(io::Error::other(
             "Open streamdock-fw tui in an interactive terminal.",
         ));
     }
-    let mut app = App {
-        flasher,
-        ..App::default()
-    };
+    let mut app = App::default();
     let result = (|| {
         let mut terminal = ratatui::try_init()?;
         let _ = execute!(terminal.backend_mut(), EnableBracketedPaste);

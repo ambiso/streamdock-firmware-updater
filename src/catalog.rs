@@ -9,6 +9,7 @@ use crate::{Feedback, Result, download};
 
 const CDN: &str = "https://cdn1.key123.vip/";
 const DOWNLOAD_PREFIX: &str = "https://cdn1.key123.vip/StreamDock/firmware/download/";
+const MIRABOX_DOWNLOAD_PREFIX: &str = "https://cdn.mirabox.net/StreamDock/firmware/download/";
 const MANIFESTS: &[&str] = &[
     "StreamDock/firmware/firmware-version-check.json",
     "StreamDock/firmware/firmware-version-check-test.json",
@@ -55,8 +56,19 @@ impl Entry {
             .into_iter()
             .flatten()
             .find(|url| !url.is_empty())?;
-        let filename = url.strip_prefix(DOWNLOAD_PREFIX)?;
-        if filename.contains(['/', '\\', '?', '#']) || !filename.ends_with(".img") {
+        let filename = url
+            .strip_prefix(DOWNLOAD_PREFIX)
+            .or_else(|| url.strip_prefix(MIRABOX_DOWNLOAD_PREFIX))?;
+        // The vendor uses both literal and escaped spaces in filenames.
+        // Accept one filename component and leave other escapes rejected.
+        let filename = filename.replace("%20", " ");
+        let stem = filename.strip_suffix(".img")?;
+        if stem.is_empty()
+            || !stem.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b' ' | b'.' | b'_' | b'-' | b'(' | b')' | b'+')
+            })
+        {
             return None;
         }
         Some(url)
@@ -307,6 +319,55 @@ mod tests {
     use serde_json::json;
 
     const URL: &str = "https://cdn1.key123.vip/StreamDock/firmware/download/dock.img";
+
+    #[test]
+    fn accepts_the_current_vendor_image_host() {
+        let catalog = serde_json::from_value::<Catalog>(json!({
+            "CurrentVersion": {
+                "MBox-N4 E": {
+                    "variants": {
+                        "V3.Mbox_N4E": {
+                            "Version": "V3.Mbox_N4E.02.018",
+                            "fileURL": "https://cdn.mirabox.net/StreamDock/firmware/download/V3.Mbox_N4E_HJDF.02.018.img"
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let update = select_update(&[catalog], "V3.Mbox_N4E.02.014", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.version(), "V3.Mbox_N4E.02.018");
+    }
+
+    #[test]
+    fn accepts_only_a_single_firmware_filename_under_the_download_prefix() {
+        for filename in ["A dock.img", "A%20dock.img", "V3.Dock.02.018.img"] {
+            let url = format!("{}{filename}", super::MIRABOX_DOWNLOAD_PREFIX);
+            let entry = super::Entry {
+                file_url: Some(url.clone()),
+                ..Default::default()
+            };
+            assert_eq!(entry.image_url(), Some(url.as_str()));
+        }
+        for filename in [
+            "../dock.img",
+            "subdir/dock.img",
+            r"subdir\dock.img",
+            "subdir%2Fdock.img",
+            "subdir%5Cdock.img",
+            "subdir%252Fdock.img",
+            "dock?file=other.img",
+            "dock#other.img",
+        ] {
+            let entry = super::Entry {
+                file_url: Some(format!("{}{filename}", super::MIRABOX_DOWNLOAD_PREFIX)),
+                ..Default::default()
+            };
+            assert_eq!(entry.image_url(), None, "{filename}");
+        }
+    }
 
     fn select_update(
         catalogs: &[Catalog],

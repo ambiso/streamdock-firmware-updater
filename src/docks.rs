@@ -146,25 +146,6 @@ fn usb_address(_: &HidDevice) -> Option<(u8, u8)> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn hid_updater_address(port: &crate::UsbDevice) -> Option<(u8, u8)> {
-    use std::{fs, path::Path};
-
-    let name = format!("{}-{}", port.bus, port.path.replace('-', "."));
-    let device = Path::new("/sys/bus/usb/devices").join(name);
-    let vendor = fs::read_to_string(device.join("idVendor")).ok()?;
-    let product = fs::read_to_string(device.join("idProduct")).ok()?;
-    if format!("{}:{}", vendor.trim(), product.trim()) != crate::HID_UPDATER {
-        return None;
-    }
-    let address = fs::read_to_string(device.join("devnum"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some((port.bus, address))
-}
-
-#[cfg(target_os = "linux")]
 pub async fn open_hid_updater(address: (u8, u8)) -> Result<Option<crate::hid_updater::HidUpdater>> {
     let backend = HidBackend::default();
     let mut candidates = backend.enumerate().await?.filter(|device| {

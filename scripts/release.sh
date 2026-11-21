@@ -14,6 +14,8 @@ macos=aarch64-apple-darwin
 
 rustup toolchain install "$toolchain" --profile minimal \
   --target "$linux" --target "$linux_arm" --target "$windows" --target "$windows_arm" --target "$macos"
+RUSTC="$(rustup which --toolchain "$toolchain" rustc)"
+export RUSTC
 rustup run "$toolchain" cargo zigbuild --release --locked --target "$linux"
 rustup run "$toolchain" cargo zigbuild --release --locked --target "$linux_arm"
 rustup run "$toolchain" cargo build --release --locked --target "$windows"
