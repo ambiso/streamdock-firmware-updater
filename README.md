@@ -37,8 +37,6 @@ The release also provides `SHA256SUMS` for verifying the download.
 | Windows ARM64 (Windows 11) | [streamdock-fw-windows-arm64.exe][windows-arm64] |
 | macOS Apple Silicon | [streamdock-fw-macos-arm64][macos-arm64] |
 
-The v0.1.0 release uses the original `akp05-updater` name.
-
 ## Terminal interface
 
 On Windows, double-click the downloaded `.exe` to open the interface.
